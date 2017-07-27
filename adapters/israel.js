@@ -3,35 +3,28 @@ import { REQUEST_TIMEOUT } from '../lib/constants';
 import { default as baseRequest } from 'request';
 import { default as moment } from 'moment-timezone';
 import cheerio from 'cheerio';
-import lodash from 'lodash';
-import async from 'async';
+
+import { waterfall, series, parallel, parallelLimit } from 'async';
 const request = baseRequest.defaults({timeout: REQUEST_TIMEOUT});
-const _ = lodash;
 export const name = 'israel';
 
 export function fetchData (source, callback) {
   const regionPageTasks = regionPages(9, 20, source.url);
-  regionPageTasks.map((source, index) => {
-    // since handeState wraps async.waterfall w/a callback,
-    // this returns a async.waterfall's callback
-    const data = handleState(source);
-
-    // if data for the region exists, cb, not cb err
-    try {
-      if (data === undefined) {
-        return callback(new Error('Failed to parse data.'));
+  parallel(
+    regionPageTasks,
+    (err, res) => {
+      if (err) {
+        return ({message: 'Unknown adapter error'}, null);
       }
-      // return obj with data for stations within single region
-      callback(null, data);
-    } catch (err) {
-      return err;
+      callback(null, [].concat.apply(res));
     }
-  });
+  );
 }
 
 // link of lists for each region's site page
 const regionPages = (start, end, source) => [...Array(end - start + 1)].map((_, i) => {
-  return source + 'DynamicTable.aspx?G_ID=' + (start + i);
+  source = source.replace('<id>', (start + i));
+  return handleState(source);
 });
 
 /* return data for all stations in each region
@@ -42,96 +35,100 @@ const regionPages = (start, end, source) => [...Array(end - start + 1)].map((_, 
  *
  */
 var handleState = function (source) {
-  async.waterfall([
-    (callback) => {
-      let headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Content-Type': 'text/html; charset=utf-8',
-        'Referer': 'http://www.svivaaqm.net/MenuSite.aspx'
-      };
-      request.get({
-        url: source,
-        headers: headers
-      }, (err, res, body) => {
-        if (err || res.statusCode !== 200) {
-          return callback(new Error('Failed to access: ' + source));
-        }
-        let $ = cheerio.load(body);
-        // get regoin name from <span> with this id
-        let name = $('#lblCaption').text().split('- ')[1];
-        if (name) { name = name.split('').reverse().join(''); }
-        // grab all <a></a> elements and get attached links
-        const links = $('a');
-        let stationLinks = [];
-        links.map((a) => {
-          stationLinks.push(links[a].attribs.href);
-        });
-        // station data and their averaging intervals exist on two separate pages
-        // so, two lists of requests are made. One for data, the other for
-        // interavls.
-        const stationDataRequests = handleStation(stationLinks, headers, source);
-        const stationIntervalRequests = handleInterval(stationLinks, headers, source);
-
-        callback(null, [stationDataRequests, stationIntervalRequests], name);
-      });
-    },
-    function (stationRequests, name, callback) {
-      // pass stationDataRequests and stationIntervalRequests into
-      // their own async parallels sitting in an async. series
-      // upon their completion, map intervals to the different stations'
-      // interval values.
-      async.series([
-        (callback) => {
-          async.parallelLimit(
-            stationRequests[0], 2,
-            (err, results) => {
-              if (err) {
-                return callback(new Error('Failed to gather measurements for:' + name));
-              }
-              // merge each measurements list into one large list
-              callback(null, results, name);
-            }
-          );
-        },
-        (callback) => {
-          let intervalsFin;
-          async.parallelLimit(
-            stationRequests[1], 2,
-            (err, results) => {
-              if (err) {
-                return callback(new Error('Failed to gather measurements for:' + name));
-              }
-              // merge each measurements list into one large list
-              intervalsFin = [].concat.apply([], results);
-              callback(null, intervalsFin, name);
-            }
-          );
-        }
-      ], (err, results) => {
-        if (err) {
-          return callback(new Error('Failed to gather data and intervals'));
-        }
-        results[0][0].forEach((val, index) => {
-          val.forEach((innerVal, innerIndex) => {
-            results[0][0][index][innerIndex].averagingPeriod.value = results[1][0][index];
+  return (callback) => {
+    waterfall([
+      (callback) => {
+        let headers = {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Content-Type': 'text/html; charset=utf-8',
+          'Referer': 'http://www.svivaaqm.net/MenuSite.aspx'
+        };
+        request.get({
+          url: source,
+          headers: headers
+        }, (err, res, body) => {
+          if (err || res.statusCode !== 200) {
+            return callback({message: 'Failed to access: ' + source}, null);
+          }
+          let $ = cheerio.load(body);
+          // get regoin name from <span> with this id
+          let name = $('#lblCaption').text().split('- ')[1];
+          if (name) { name = name.split('').reverse().join(''); }
+          // grab all <a></a> elements and get attached links
+          const links = $('a');
+          let stationLinks = [];
+          links.map((a) => {
+            stationLinks.push(links[a].attribs.href);
           });
+          // station data and their averaging intervals exist on two separate pages
+          // so, two lists of requests are made. One for data, the other for
+          // interavls.
+          const stationDataRequests = handleStation(stationLinks, headers, source);
+          const stationIntervalRequests = handleInterval(stationLinks, headers, source);
+
+          callback(null, [stationDataRequests, stationIntervalRequests], name);
         });
-        const finMeasurements = [].concat.apply([], results[0][0]);
-        callback(null, finMeasurements);
-      });
-    },
-    function (measurementsFin, callback) {
-      if (!(measurementsFin.length === 0)) {
-        const aqObj = {};
-        aqObj['name'] = 'Israel';
-        aqObj['measurements'] = measurementsFin;
-        callback(null, aqObj);
+      },
+      (stationRequests, name, callback) => {
+        // pass stationDataRequests and stationIntervalRequests into
+        // their own async parallels sitting in an async. series
+        // upon their completion, map intervals to the different stations'
+        // interval values.
+        series([
+          (callback) => {
+            parallelLimit(stationRequests[0], 2,
+              (err, results) => {
+                if (err) {
+                  return callback({message: 'Failed to gather measurements for:' + name}, []);
+                }
+                // merge each measurements list into one large list
+                callback(null, results, name);
+              }
+            );
+          },
+          (callback) => {
+            let intervalsFin;
+            parallelLimit(
+              stationRequests[1], 2,
+              (err, results) => {
+                if (err) {
+                  return callback({message: 'Failed to gather measurements for:' + name}, []);
+                }
+                // merge each measurements list into one large list
+                intervalsFin = [].concat.apply([], results);
+                callback(null, intervalsFin, name);
+              }
+            );
+          }
+        ], (err, results) => {
+          if (err) {
+            return callback({message: 'Failed to gather data and intervals'}, []);
+          }
+          results[0][0].forEach((val, index) => {
+            val.forEach((innerVal, innerIndex) => {
+              results[0][0][index][innerIndex].averagingPeriod.value = results[1][0][index];
+            });
+          });
+          const finMeasurements = [].concat.apply([], results[0][0]);
+          callback(null, finMeasurements);
+        });
+      },
+      (measurementsFin, callback) => {
+        if (!(measurementsFin.length === 0)) {
+          const aqObj = {};
+          aqObj['name'] = 'Israel';
+          aqObj['measurements'] = measurementsFin;
+          callback(null, aqObj);
+        }
       }
-    }
-  ], (err, res) => {
-    if (err) { throw err; }
-  });
+    ], (err, res) => {
+      if (err) {
+        return callback({message: 'There was an error parsing data from the source'}, []);
+      }
+      callback(null, res);
+    });
+  };
 };
 
 /* make list of functions to grab data from each region page
@@ -168,7 +165,7 @@ var handleStation = function (stationLinks, headers, source) {
               if (index > 0) {
                 const pollutant = aqData[0][index];
                 // only create objs when the pollutent one tracked by openAQ
-                if (_.includes(['SO2', 'PM10', 'PM2.5', 'No2', 'O3'], pollutant)) {
+                if (includes(['SO2', 'PM10', 'PM2.5', 'No2', 'O3'], pollutant)) {
                   const value = aqData[2][index];
                   // further, only create the object if the measurement is not NaN, or nothing
                   if (!(isNaN(parseInt(value)))) {
@@ -178,27 +175,27 @@ var handleStation = function (stationLinks, headers, source) {
                       'DD/MM/YYYY HH:mm:ss',
                       'Asia/Jerusalem'
                     );
-                    const measurement = {};
-                    measurement['parameter'] = pollutant;
-                    measurement['date'] = {
-                      utc: time.toDate(),
-                      local: time.format()
-                    };
-                    measurement['coordinates'] = {
-                      latitude: coords[1],
-                      longitude: coords[0]
-                    };
-                    measurement['value'] = value;
-                    measurement['unit'] = aqData[1][index];
-                    measurement['attribution'] = [{
-                      name: 'Israel Ministry of Environmental Protection',
-                      url: 'http://www.svivaaqm.net/'
-                    }];
-                    // TODO: use javascript:__doPostBack('lnkStationReport','') found on page to grab this.
-                    // this is per success w/Dolugon's method.
-                    measurement['averagingPeriod'] = {
-                      unit: 'hours',
-                      value: 'time'
+                    const measurement = {
+                      parameter: pollutant,
+                      date: {
+                        utc: time.toDate(),
+                        local: time.format()
+                      },
+                      coordinates: {
+                        latitude: coords[1],
+                        longitude: coords[0]
+                      },
+                      value: value,
+                      unit: aqData[1][index],
+                      attribution: [{
+                        name: 'Israel Ministry of Environmental Protection',
+                        url: 'http://svivaaqm.net/'
+                      }],
+                      // thes below are place holders. these are changed to correct periods
+                      averagingPeriod: {
+                        unit: 'hours',
+                        value: 'time'
+                      }
                     };
                     measurements.push(measurement);
                   }
